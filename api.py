@@ -66,6 +66,16 @@ def resolve_token() -> str:
 
     raise HTTPException(status_code=401, detail="No token")
 
+def _token_status():
+    """Return current token info or None."""
+    global _api_token
+    try:
+        t = resolve_token()
+        info = get_token_info(t)
+        return {"user": info.get("name"), "expires_in": info.get("expires_in"), "ok": info.get("expires_in", 0) > 60}
+    except:
+        return None
+
 # --- Models ---
 
 MODEL_TONES = {
@@ -226,7 +236,23 @@ _CHAT_HTML = os.path.join(os.path.dirname(__file__), "chat.html")
 async def index():
     if os.path.exists(_CHAT_HTML):
         return FileResponse(_CHAT_HTML)
-    return {"msg": "M365 Copilot API. Open /v1/models or POST /v1/chat/completions"}
+    return {"msg": "M365 Copilot API - POST /v1/chat/completions"}
+
+@app.get("/v1/token/status")
+async def token_status():
+    info = _token_status()
+    if info:
+        return info
+    raise HTTPException(status_code=401, detail="No valid token")
+
+@app.post("/v1/token/refresh")
+async def token_refresh():
+    global _api_token
+    _api_token = None
+    info = _token_status()
+    if info:
+        return {"status": "ok", **info}
+    raise HTTPException(status_code=401, detail="Token refresh failed")
 
 @app.get("/v1/models")
 async def list_models():

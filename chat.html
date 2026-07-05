@@ -384,6 +384,11 @@ textarea::placeholder { color: var(--color-text-tertiary); }
       <span class="connection-dot" id="conn-dot"></span>
       <span id="conn-text">检查连接...</span>
     </div>
+    <div class="connection-status" style="margin-bottom:var(--spacing-sm)" id="token-row" hidden>
+      <span class="connection-dot" id="token-dot"></span>
+      <span id="token-text" style="flex:1"></span>
+      <button style="background:none;border:none;color:var(--color-info);cursor:pointer;font-size:12px;padding:0" onclick="refreshToken()">↻</button>
+    </div>
     <button class="btn btn-primary" onclick="newChat()">+ 新对话</button>
     <button class="btn btn-ghost" onclick="scrollToBottom()">↓ 到底部</button>
   </div>
@@ -445,6 +450,7 @@ addMsg('system', '✦ 连接 M365 Copilot...');
     });
     $('messages').innerHTML = '';
     addMsg('system', '✦ 已连接 · 选择模型开始对话');
+    checkToken();
   } catch {
     setConn(false);
     $('messages').innerHTML = '';
@@ -461,6 +467,38 @@ function setConn(ok) {
   const dot = $('conn-dot'), txt = $('conn-text');
   dot.className = 'connection-dot ' + (ok ? 'on' : 'off');
   txt.textContent = ok ? '已连接' : '未连接';
+}
+
+async function checkToken() {
+  try {
+    const r = await fetch(url() + '/token/status');
+    const d = await r.json();
+    const row = $('token-row'); row.hidden = false;
+    const dot = $('token-dot'), txt = $('token-text');
+    if (d.ok) {
+      dot.className = 'connection-dot on';
+      const min = Math.round(d.expires_in / 60);
+      txt.textContent = d.user + ' · ' + min + 'min';
+    } else {
+      dot.className = 'connection-dot off';
+      txt.textContent = d.user + ' · 即将过期';
+    }
+  } catch {}
+}
+async function refreshToken() {
+  try {
+    $('token-text').textContent = '刷新中...';
+    const r = await fetch(url() + '/token/refresh', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      const min = Math.round(d.expires_in / 60);
+      $('token-dot').className = 'connection-dot on';
+      $('token-text').textContent = d.user + ' · ' + min + 'min';
+    }
+  } catch {
+    $('token-dot').className = 'connection-dot off';
+    $('token-text').textContent = '刷新失败';
+  }
 }
 
 function addMsg(role, content) {

@@ -1,0 +1,15 @@
+{
+  "name": "m365-chat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "M365 Copilot chat frontend — LobeHub design",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "http-proxy-middleware": "^4.2.0"
+  }
+}

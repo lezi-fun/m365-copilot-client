@@ -1,0 +1,30 @@
+[project]
+name = "m365-copilot-client"
+version = "0.1.0"
+description = "Unofficial Python client and OpenAI-compatible API server for Microsoft 365 Copilot"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "msal>=1.28.0",
+    "websockets>=12.0",
+    "httpx>=0.27.0",
+    "click>=8.1.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/lezi-fun/m365-copilot-client"
+Repository = "https://github.com/lezi-fun/m365-copilot-client"
+
+[project.scripts]
+m365-copilot = "m365_copilot.cli:cli"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

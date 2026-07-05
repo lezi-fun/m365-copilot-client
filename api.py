@@ -1,32 +1,25 @@
 """
-M365 Copilot OpenAI-Compatible API Server
-
-Usage:
-    export M365_TOKEN='***'
-    python m365_api.py --port 23100
-
-Or with a config token:
-    python m365_api.py
-    # Uses M365_TOKEN env, file cache, or MSAL auth
+M365 Copilot OpenAI-Compatible API Server — with tool calling support.
 """
 
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
+from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 
+import hashlib
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-
-# Add parent dir so m365_copilot import works
-sys.path.insert(0, str(Path(__file__).parent))
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
 from m365_copilot import (
     get_token,
@@ -34,215 +27,210 @@ from m365_copilot import (
     token_from_browser_js,
     CopilotSession,
 )
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 
 logger = logging.getLogger("m365.api")
 
-# --- App Setup ---
+app = FastAPI(title="M365 Copilot API", version="0.2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app = FastAPI(title="M365 Copilot API", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Token Resolution ---
+# --- Token ---
 
 _api_token: Optional[str] = None
 _TOKEN_FILE = Path.home() / ".config" / "m365-copilot" / "token.txt"
 
 def resolve_token() -> str:
-    """Resolve the M365 token from env var, file, or MSAL auth."""
     global _api_token
-    if _api_token:
-        return _api_token
+    if _api_token: return _api_token
 
-    # 1. Env var
-    token = os.environ.get("M365_TOKEN")
-    if token:
-        _api_token = token
-        logger.info("Token from M365_TOKEN env var")
-        return token
+    # M365_TOKEN env var
+    t = os.environ.get("M365_TOKEN")
+    if t:
+        _api_token = t; logger.info("Token: env"); return t
 
-    # 2. Token file (from m365-copilot auth or manual save)
+    # Token file
     if _TOKEN_FILE.exists():
-        try:
-            token = _TOKEN_FILE.read_text().strip()
-            if token:
-                _api_token = token
-                logger.info("Token from %s", _TOKEN_FILE)
-                return token
-        except Exception:
-            pass
+        t = _TOKEN_FILE.read_text().strip()
+        if t:
+            _api_token = t; logger.info("Token: file"); return t
 
-    # 3. Browser JS
-    token = token_from_browser_js()
-    if token:
-        _api_token = token
-        return token
+    # Browser JS / MSAL (lazy, only if needed)
+    t = token_from_browser_js()
+    if t:
+        _api_token = t; logger.info("Token: browser"); return t
 
-    # 4. MSAL cache
-    token = get_token()
-    if token:
-        _api_token = token
-        logger.info("Token from MSAL cache")
-        return token
+    t = get_token()
+    if t:
+        _api_token = t; logger.info("Token: MSAL"); return t
 
-    raise HTTPException(
-        status_code=401,
-        detail="No M365 token. Set M365_TOKEN or run auth first.",
-    )
+    raise HTTPException(status_code=401, detail="No token")
 
-# --- Model Map ---
+# --- Models ---
 
-AVAILABLE_MODELS = {
-    "auto": "magic",
-    "quick": "Gpt_Quick",
-    "think-deeper": "Gpt_Reasoning",
-    "claude-sonnet": "Claude_Sonnet",
-    "claude-sonnet-4.6": "Claude_Sonnet",
+MODEL_TONES = {
+    "auto": "magic", "quick": "Gpt_Quick", "think-deeper": "Gpt_Reasoning",
+    "claude-sonnet": "Claude_Sonnet", "claude-sonnet-4.6": "Claude_Sonnet",
     "claude-opus": "Claude_Opus",
-    "gpt-5.5": "Gpt_5_5_Chat",
-    "gpt-5.5-quick": "Gpt_5_5_Chat",
+    "gpt-5.5": "Gpt_5_5_Chat", "gpt-5.5-quick": "Gpt_5_5_Chat",
     "gpt-5.5-think-deeper": "Gpt_5_5_Reasoning",
-    "gpt-5.4": "Gpt_5_4_Reasoning",
-    "gpt-5.4-quick": "Gpt_5_4_Quick",
-    "gpt-5.3": "Gpt_5_3_Quick",
-    "gpt-5.2": "Gpt_5_2_Quick",
+    "gpt-5.4": "Gpt_5_4_Reasoning", "gpt-5.4-quick": "Gpt_5_4_Quick",
+    "gpt-5.3": "Gpt_5_3_Quick", "gpt-5.2": "Gpt_5_2_Quick",
 }
 
-def get_tone(model: str) -> str:
-    return AVAILABLE_MODELS.get(model) or "magic"
+# --- Schemas ---
 
-# --- Request Models ---
-
+class ToolFunction(BaseModel):
+    name: str; description: str = ""; parameters: dict[str, Any] = {}
+class ToolDef(BaseModel):
+    type: str = "function"; function: ToolFunction
 class ChatMessage(BaseModel):
-    role: str
-    content: str
-
+    role: str; content: str = ""
+    tool_calls: Optional[list[dict]] = None
+    tool_call_id: Optional[str] = None
 class ChatCompletionRequest(BaseModel):
-    model: str = "auto"
-    messages: list[ChatMessage]
-    stream: bool = False
-    user: Optional[str] = None
-
+    model: str = "auto"; messages: list[ChatMessage]; stream: bool = False
+    tools: Optional[list[ToolDef]] = None; tool_choice: Any = None
 class ModelInfo(BaseModel):
-    id: str
-    object: str = "model"
-    created: int = 0
-    owned_by: str = "m365-copilot"
-
+    id: str; object: str = "model"; created: int = 0; owned_by: str = "m365-copilot"
 class ModelList(BaseModel):
-    object: str = "list"
-    data: list[ModelInfo]
+    object: str = "list"; data: list[ModelInfo]
 
-# --- Helpers ---
+# --- Built-in Tools ---
 
-def build_chat_id() -> str:
+BUILTIN_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_current_time",
+        "description": "获取当前日期和时间",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "calculate",
+        "description": "执行数学计算",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string", "description": "数学表达式"},
+        }, "required": ["expression"]},
+    }},
+]
+
+def _execute_tool(name: str, args: dict) -> str:
+    if name == "get_current_time":
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if name == "calculate":
+        try:
+            allowed = {"abs": abs, "round": round, "min": min, "max": max, "pow": pow}
+            return str(eval(args["expression"], {"__builtins__": {}}, allowed))
+        except Exception as e:
+            return f"Error: {e}"
+    return f"Unknown tool: {name}"
+
+# Tool prompt injection
+TOOL_PROMPT = """You have access to tools. When you need to use one, output EXACTLY this format on its own line:
+
+```tool_call
+{"tool": "tool_name", "arguments": {"arg1": "val1"}}
+```
+
+After getting the result, either call another tool or give the final answer in plain text."""
+
+def _inject_tools(messages: list[dict], tools: list[dict]) -> list[dict]:
+    if not tools:
+        return messages
+    prompt = TOOL_PROMPT + "\n\nAvailable tools:\n" + json.dumps(tools, indent=2, ensure_ascii=False)
+    for m in messages:
+        if m.get("role") == "system":
+            m["content"] = prompt + "\n\n" + (m.get("content") or "")
+            return messages
+    return [{"role": "system", "content": prompt}] + messages
+
+def _find_tool_calls(text: str) -> list[dict]:
+    calls = []
+    for m in re.finditer(r'```tool_call\s*\n(\{.*?\})\s*\n\s*```', text, re.DOTALL):
+        try:
+            calls.append(json.loads(m.group(1)))
+        except json.JSONDecodeError:
+            pass
+    if calls:
+        return calls
+    # Bare JSON fallback
+    for m in re.finditer(r'\{"tool"\s*:', text):
+        try:
+            start = m.start()
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == '{': depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        obj = json.loads(text[start:i+1])
+                        if "tool" in obj and "arguments" in obj:
+                            calls.append(obj)
+                        break
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return calls
+
+def _make_chat_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:16]}"
 
-def build_openai_chunk(chat_id: str, model: str, content: str,
-                       finish_reason: Optional[str] = None) -> str:
-    chunk = {
-        "id": chat_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {"content": content} if content else {},
-            "finish_reason": finish_reason,
-        }],
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-def build_openai_response(chat_id: str, model: str, content: str,
-                          usage: Optional[dict] = None) -> dict:
-    resp = {
-        "id": chat_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
-        }],
-    }
-    if usage:
-        resp["usage"] = usage
-    return resp
+def _delta(model: str, cid: str, content: str = "", tcs: Optional[list] = None, fr: Optional[str] = None) -> str:
+    d = {}
+    if content: d["content"] = content
+    if tcs: d["tool_calls"] = tcs
+    return _sse({"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                  "model": model, "choices": [{"index": 0, "delta": d, "finish_reason": fr}]})
 
-# --- Session Pool with message-based context matching ---
-
-from collections import OrderedDict
-import hashlib
+# --- Session Pool ---
 
 _session_pool: OrderedDict[str, CopilotSession] = OrderedDict()
-_msg_prefix_to_session: dict[str, str] = {}
-_MAX_SESSIONS = 100
+_msg_map: dict[str, str] = {}
+_MAX_S = 100
 
-def _messages_fingerprint(messages: list[ChatMessage], count: int) -> str:
-    """Hash the first `count` messages to create a fingerprint."""
-    prefix = messages[:count]
-    data = json.dumps(
-        [{"role": m.role, "content": m.content[:300]} for m in prefix],
-        sort_keys=True, ensure_ascii=False,
-    )
-    return hashlib.sha256(data.encode()).hexdigest()[:16]
+def _session(token: str, msgs: list[ChatMessage]) -> tuple[CopilotSession, str]:
+    # 用第一条用户消息的内容作为会话 key
+    first_user = ""
+    for m in msgs:
+        if m.role == "user":
+            first_user = (m.content or "")[:200]
+            break
 
-def get_or_create_session(token: str, messages: list[ChatMessage]) -> tuple[CopilotSession, str]:
-    """
-    Match conversation by message history prefix.
-    - If messages[0:-1] matches a previous session → reuse it
-    - Otherwise → create new session
-    
-    Returns (session, session_key).
-    """
-    # Try to find an existing session by message prefix (all but last)
-    if len(messages) > 1:
-        prefix_key = _messages_fingerprint(messages, len(messages) - 1)
-        if prefix_key in _msg_prefix_to_session:
-            session_key = _msg_prefix_to_session[prefix_key]
-            if session_key in _session_pool:
-                # Move to end (most recently used)
-                session = _session_pool.pop(session_key)
-                _session_pool[session_key] = session
-                logger.debug("Reused session: key=%s turn=%d", session_key[:8], session.turn_count)
-                return session, session_key
+    if first_user:
+        k = hashlib.sha256(first_user.encode()).hexdigest()[:16]
+        if k in _msg_map and _msg_map[k] in _session_pool:
+            sk = _msg_map[k]
+            s = _session_pool.pop(sk)
+            _session_pool[sk] = s
+            return s, sk
 
-    # New session
-    session_key = str(uuid.uuid4())
-    session = CopilotSession(token=token)
-    _session_pool[session_key] = session
-
-    # LRU eviction
-    while len(_session_pool) > _MAX_SESSIONS:
-        old_key, old_session = _session_pool.popitem(last=False)
-        # Also clean up prefix mappings pointing to this session
-        keys_to_delete = [k for k, v in _msg_prefix_to_session.items() if v == old_key]
-        for k in keys_to_delete:
-            del _msg_prefix_to_session[k]
-
-    # Store mapping from full message hash → session key
-    full_key = _messages_fingerprint(messages, len(messages))
-    _msg_prefix_to_session[full_key] = session_key
-
-    logger.info("New session: key=%s conv=%s", session_key[:8], session.conversation_id[:8])
-    return session, session_key
-
+    sk = str(uuid.uuid4())
+    s = CopilotSession(token=token)
+    _session_pool[sk] = s
+    while len(_session_pool) > _MAX_S:
+        ok, _ = _session_pool.popitem(last=False)
+        for k in list(_msg_map.keys()):
+            if _msg_map[k] == ok:
+                del _msg_map[k]
+    if first_user:
+        _msg_map[hashlib.sha256(first_user.encode()).hexdigest()[:16]] = sk
+    return s, sk
 
 # --- Routes ---
 
+import os
+_CHAT_HTML = os.path.join(os.path.dirname(__file__), "chat.html")
+
+@app.get("/")
+async def index():
+    if os.path.exists(_CHAT_HTML):
+        return FileResponse(_CHAT_HTML)
+    return {"msg": "M365 Copilot API. Open /v1/models or POST /v1/chat/completions"}
+
 @app.get("/v1/models")
 async def list_models():
-    return ModelList(data=[
-        ModelInfo(id=name, created=int(time.time()))
-        for name in AVAILABLE_MODELS
-    ])
-
+    return ModelList(data=[ModelInfo(id=n, created=int(time.time())) for n in MODEL_TONES])
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatCompletionRequest, request: Request):
@@ -254,124 +242,144 @@ async def chat_completions(body: ChatCompletionRequest, request: Request):
         raise HTTPException(status_code=401, detail=str(e))
 
     if not body.messages:
-        raise HTTPException(status_code=400, detail="messages is required")
+        raise HTTPException(status_code=400, detail="messages required")
 
-    # Extract user messages
-    last_user_msg = None
-    for msg in reversed(body.messages):
-        if msg.role == "user":
-            last_user_msg = msg.content
+    # Build tool list
+    tools = []
+    if body.tools:
+        for t in body.tools:
+            if t.type == "function":
+                tools.append({"type": "function", "function": {
+                    "name": t.function.name, "description": t.function.description,
+                    "parameters": t.function.parameters,
+                }})
+    else:
+        tools = BUILTIN_TOOLS
+
+    # Get last user message
+    last = ""
+    for m in reversed(body.messages):
+        if m.role == "user":
+            last = m.content
             break
-    if not last_user_msg:
-        raise HTTPException(status_code=400, detail="No user message")
+    if not last:
+        raise HTTPException(status_code=400, detail="no user message")
 
-    # Conversation context: auto-match by message history
-    session, active_conv_id = get_or_create_session(token, body.messages)
+    # Inject tools into messages for the model context
+    # (We don't send system prompt to M365 directly, but we inject along with user msg)
+    if tools:
+        last = f"[Tools available: {json.dumps(tools, ensure_ascii=False)}]\n\n{last}"
 
-    tone = get_tone(body.model)
+    session, conv = _session(token, body.messages)
+    tone = MODEL_TONES.get(body.model, "magic")
+    cid = _make_chat_id()
 
-    logger.info("Chat: model=%s tone=%s turn=%d conv=%s msg=%s",
-        body.model, tone, session.turn_count, active_conv_id[:8], last_user_msg[:80])
+    logger.info("Chat: model=%s tone=%s tools=%d conv=%s", body.model, tone, len(tools), conv[:8])
 
-    chat_id = build_chat_id()
+    async def do_chat() -> dict:
+        """Non-streaming: send message, check for tool calls, loop."""
+        msg = last
+        max_round = 6
+        for r in range(max_round):
+            resp = await session.send(msg, tone=tone, on_delta=None)
+            if resp.error:
+                return {"id": cid, "object": "chat.completion", "created": int(time.time()),
+                        "model": body.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": resp.error}, "finish_reason": "stop"}]}
+            if resp.disengaged:
+                return {"id": cid, "object": "chat.completion", "created": int(time.time()),
+                        "model": body.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": "(disengaged)"}, "finish_reason": "stop"}]}
 
-    async def stream_response() -> AsyncGenerator[str, None]:
-        nonlocal chat_id
-        full_text = ""
+            text = resp.text
+            tcs = _find_tool_calls(text)
 
-        def on_chunk(chunk: str):
-            nonlocal full_text
-            full_text += chunk
+            # Strip tool call block from displayed text
+            clean = re.sub(r'```tool_call.*?```\s*', '', text, flags=re.DOTALL).strip()
+            # Remove any bare tool JSON
+            clean = re.sub(r'\{"tool".*?"\}\}', '', clean).strip()
 
-        resp = await session.send(last_user_msg, tone=tone, on_delta=on_chunk)
+            if not tcs:
+                # No more tool calls → final answer
+                resp_text = clean or text
+                return {"id": cid, "object": "chat.completion", "created": int(time.time()),
+                        "model": body.model,
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": resp_text}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": len(msg), "completion_tokens": len(resp_text)}}
 
-        if resp.disengaged:
-            yield build_openai_chunk(chat_id, body.model, "")
-            yield "data: [DONE]\n\n"
-            return
+            # Execute tool calls
+            results = []
+            for tc in tcs:
+                name = tc.get("tool", "?")
+                args = tc.get("arguments", {})
+                result = _execute_tool(name, args)
+                results.append(f"[{name}]\n{result[:500]}")
 
-        if resp.error:
-            yield build_openai_chunk(chat_id, body.model, "")
-            yield "data: [DONE]\n\n"
-            return
+            msg = "Tool results:\n" + "\n\n".join(results)
 
-        text = full_text or resp.text
-        if text:
-            yield build_openai_chunk(chat_id, body.model, text)
+        return {"id": cid, "object": "chat.completion", "created": int(time.time()),
+                "model": body.model, "choices": [{"index": 0, "message": {"role": "assistant", "content": "Max rounds reached"}, "finish_reason": "stop"}]}
 
-        yield build_openai_chunk(chat_id, body.model, "", finish_reason="stop")
+    async def stream_chat() -> AsyncGenerator[str, None]:
+        """Streaming: yield SSE chunks."""
+        msg = last
+        max_round = 6
+        for r in range(max_round):
+            resp = await session.send(msg, tone=tone, on_delta=None)
+            if resp.error or resp.disengaged:
+                yield _delta(body.model, cid, "")
+                yield "data: [DONE]\n\n"
+                return
+
+            text = resp.text
+            tcs = _find_tool_calls(text)
+            clean = re.sub(r'```tool_call.*?```\s*', '', text, flags=re.DOTALL).strip()
+            clean = re.sub(r'\{"tool".*?"\}\}', '', clean).strip()
+
+            if not tcs:
+                if clean:
+                    yield _delta(body.model, cid, clean)
+                yield _delta(body.model, cid, "", fr="stop")
+                yield "data: [DONE]\n\n"
+                return
+
+            # Execute tools
+            results = []
+            for tc in tcs:
+                name = tc.get("tool", "?")
+                args = tc.get("arguments", {})
+                result = _execute_tool(name, args)
+                results.append(f"[{name}]\n{result[:500]}")
+
+            msg = "Tool results:\n" + "\n\n".join(results)
+
+        yield _delta(body.model, cid, "", fr="stop")
         yield "data: [DONE]\n\n"
 
-    resp_headers = {
-        "X-Conversation-Id": active_conv_id,
-    }
-
     if body.stream:
-        return StreamingResponse(
-            stream_response(),
-            media_type="text/event-stream",
-            headers={
-                **resp_headers,
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        return StreamingResponse(stream_chat(), media_type="text/event-stream",
+                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    # Non-streaming
-    full_text = ""
-    def on_chunk(chunk: str):
-        nonlocal full_text
-        full_text += chunk
-
-    resp = await session.send(last_user_msg, tone=tone, on_delta=on_chunk)
-
-    if resp.error:
-        raise HTTPException(status_code=502, detail=resp.error)
-    if resp.disengaged:
-        raise HTTPException(status_code=502, detail="Disengaged by M365")
-
-    text = full_text or resp.text
-    return build_openai_response(chat_id, body.model, text, usage={
-        "prompt_tokens": len(last_user_msg),
-        "completion_tokens": len(text),
-        "total_tokens": len(last_user_msg) + len(text),
-    })
-
+    return await do_chat()
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "models": list(AVAILABLE_MODELS.keys())}
-
+    return {"status": "ok", "models": list(MODEL_TONES.keys())}
 
 # --- Main ---
 
 def main():
     import argparse
-
-    parser = argparse.ArgumentParser(description="M365 Copilot API Server")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
-    parser.add_argument("--port", type=int, default=23100, help="Bind port")
-    parser.add_argument("--reload", action="store_true", help="Auto-reload")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose")
-    args = parser.parse_args()
-
-    if args.verbose:
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=23100)
+    p.add_argument("-v", "--verbose", action="store_true")
+    a = p.parse_args()
+    if a.verbose:
         logging.getLogger("m365").setLevel(logging.DEBUG)
-
     try:
-        token = resolve_token()
-        info = get_token_info(token)
-        logger.info("Token: user=%s oid=%s", info.get("name", "?"), info.get("oid", "?")[:8])
+        resolve_token()
     except Exception as e:
         logger.warning("No token: %s", e)
-
-    uvicorn.run(
-        "api:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-    )
-
+    uvicorn.run("api:app", host=a.host, port=a.port)
 
 if __name__ == "__main__":
     main()
